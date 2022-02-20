@@ -1,0 +1,656 @@
+/*
+ * ATtiny24a and display 3642BS-1 + RTS DS1307Z
+ * Time & Rele
+ * Created: 04.12.2021 18:20:58   проверил последняя версия 03.02.2022
+ * Author : Nickolay
+
+   ATtiny44A = 8-битный счетчик + 16-битный счетчик с ШИМ
+   Timer_0 (8 bit + PWM) OCR0A, OCR0B, TCCR0A, TCCR0B, TCNT0, TIMSK0, TIFR0
+   TCCR0A = [COM0A1]~[COM0A0]~[COM0B1]~[COM0B0]~[   -   ]~[  -   ]~[ WGM01 ]~[ WGM00 ]
+   TCCR0B = [FOC0A ]~[FOC0B ]~[  -   ]~[  -   ]~[ WGM02 ]~[ CS02 ]~[  CS01 ]~[  CS00 ]
+   TIMSK0 = [ - ]~[ - ]~[ - ]~[ - ]~[ - ]~[ ICIE0B ]~[ ICIE0A ]~[ TOIE0 ]
+   TIFR0 = [ - ]~[ - ]~[ - ]~[ - ]~[ - ]~[ OCF0B ]~[ OCF0A ]~[ TOV0 ]
+ 
+   Timer_1 (16 bit + PWM) OCR1A(H/L), OCR1B(H/L), TCCR1A, TCCR1B, TCCR1C, TCNT1(H/L), ICR1(H/L), TIMSK1
+   
+   TCCR1A = [COM1A1]~[COM1A0]~[COM1B1]~[COM01B0]~[ - ]~[ - ]~[ WGM11 ]~[ WGM10 ]
+   TCCR1B = [ICNC1]~[ICES1]~[  -  ]~[ WGM13 ]~[ WGM12 ]~[ CS12 ]~[ CS11 ]~[ CS10 ] 
+   TCCR1C = [ FOC1A ]~[ FOC1B ]~[ - ]~[ - ]~[ - ]~[ - ]~[ - ]~[ - ]
+   TIMSK1 = [ - ]~[ - ]~[ ICIE1 ]~[ - ]~[ - ]~[ ICIE1B ]~[ ICIE1A ]~[ TOIE1 ]
+   TIFR1 = [ - ]~[ - ]~[ ICF1 ]~[ - ]~[ - ]~[ OCF1B ]~[ OCF1A ]~[ TOV1 ]
+
+  PB2 - 5pin - OC0A
+  PA7 - 6pin - OC0B
+  PA6 - 7pin - OC1A
+  PA5 - 8pin - OC1B   
+ 
+ */ 
+
+//#define F_CPU 8000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+//#define DT_TM      PA0   // PA0 13pin
+#define SWITCHMODE PA1   // PA1 12pin
+#define SWITCHINCR PA2   // PA2 11pin
+
+#define SWITCH_DMY   PA3   // PA3 10pin    дата+месяц+год+старт
+#define PIN_SCL      PA4   // PA4 9pin
+#define LED_1        PA5   // PA5 8pin   
+#define PIN_SDA      PA6   // PA6 7pin
+#define LED_0        PA7   // PA7 6pin   
+
+#define DIO          PB0   // PB0 2pin
+#define CLK          PB1   // PB1 3pin
+#define SWITCHADD    PB2   // PB2 5pin    ручное управление
+
+const uint8_t digitHEX[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07,0x7f, 0x6f, 0x00, 0x40};//0~9, ,-   [0,1,2,3,4,5,6,7,8,9,пусто,-]
+const uint8_t digitLed[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00};    // [a, b, c, d, e, f, g, dot, пусто]
+
+const uint8_t commandOne[] = {0x40, 0x44, 0x42, 0x46};   // [запись в регистр++, запись в фикс.регистр, чтение из регистра++, чтение из фикс.регистра]
+const uint8_t commandTwo[] = {0xC0, 0xC1, 0xC2, 0xC3};    // регистры индикатора 0-3(остальные не используются 4,5)
+const uint8_t commandThree[] = {0x80, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F};      // [дисплей выкл, дисплей вкл яркость мин - яркость макс]
+const uint8_t myDec[] = {0x00, 0x0A, 0x14, 0x1E, 0x28, 0x32};     // 0, 10, 20, 30, 40, 50
+
+#define PRESKALLER 488  // 976   970-1,006 975-1,001 976-1,000576 977-0,99955
+#define LONGSIGNAL 2   // продолжительность включеного состояния выхода LED_O/LED_1
+#define MEM_ADR  0xD0    // 1101000+0 [OLD => 0b1010`0000 = 0xA0 = 160       0b10100010 = 0xA2 = 162 (на ножке A0 = 1)  => 0xA2]
+#define TICKCOUNT_8  0b11110000;    // USISR = (1<<USISIF)|(1<<USIOIF)|(1<<USIPF)|(1<<USIDC)|(0<<USICNT3)|(0<<USICNT2)|(0<<USICNT1)|(0x0<<USICNT0);  240  0xF0  16 до переполнения
+#define TICKCOUNT_1  0b11111110;    // USISR = (1<<USISIF)|(1<<USIOIF)|(1<<USIPF)|(1<<USIDC)|(1<<USICNT3)|(1<<USICNT2)|(1<<USICNT1)|(0x0<<USICNT0);  254  0xFE   2 до переполнения
+#define REVERS_SCL   0b00101011;    // USICR = (0<<USISIE)|(0<<USIOIE)|(1<<USIWM1)|(0<<USIWM0)|(1<<USICS1)|(0<<USICS0)|(1<<USICLK)|(1<<USITC) - дергаем USITC (1 в USITC - переключает SCL на противоположный )
+
+uint8_t digits[4] ;       // для записи (часы+минуты) из РТС
+uint8_t digitsH[4] ;       // для записи (день+месяц(+год)) из РТС
+uint8_t myMasData[4];     // массив для преобразования и вывода значений
+uint8_t digitsTMP[4] ;    // для редактирования даты
+uint8_t myTikSec = 0;     // отсчет секунд
+uint8_t mySaveSec = 0;    // запоминание секунд
+
+uint8_t myFlag = 0;       // флаг прерывания таймера (полсекунды)
+uint8_t myFlagN = 0;      // флаг для моргания двух точек
+uint8_t myFlagS = 0;      // флаг при однократной записи в массив для редактирования digitsTMP
+uint8_t myFlagSH = 0;
+uint8_t myFlgSaveSec = 0;    // флаг запоминания секунд
+uint8_t myFlgDop = 0;        // запрос на переключение Led
+uint8_t myFlagSec = 0;       // флаг секунды
+uint8_t myFlagMode = 0;
+uint8_t myFlgOn = 0;
+
+uint8_t countMon;
+uint16_t myCnt = 0;
+uint8_t myTakt = 0;
+uint8_t myNullsec = 60;
+uint8_t myModeKn = 0;
+uint8_t mySwitchKn = 0;
+
+// Prototypes
+void myStart(void);
+void myStop(void);
+//void myClear(void);               // очистить дисплей
+int  writeByte(int8_t wr_data);   // процедура записи байта
+void myWritePlus(uint8_t myBright);   // 1-вариант режим автоматического увеличения адреса(дисплея) 
+void myWriteFix(uint8_t mode, uint8_t outDec, uint8_t outSim, uint8_t myBright);      // 2-вариант режим фиксированной записи данных по адресу(дисплея)
+//void myDisplayTime(uint8_t mHourH, uint8_t mHourL, uint8_t mMinH, uint8_t mMinL, uint8_t nDot, uint8_t myBright, uint8_t myPlus);
+void myDisplayTime(uint8_t mHourH, uint8_t mHourL, uint8_t mMinH, uint8_t mMinL, uint8_t nDot, uint8_t myBright);
+void myBlinkDisp(uint8_t nomDisp);
+void saifePozIndsMas(void);
+void UsiWriteRTC(uint8_t myRegister, uint8_t myDate);
+
+//----------------------------------------------------
+void initIO(void){
+      DDRA |= (1 << LED_1) | (1 << LED_0);                                  // выходы
+      DDRA &= ~(1 << SWITCHMODE) | (1 << SWITCHINCR) | (1 << SWITCH_DMY);   // входы
+      DDRB |= (1 << CLK)| (1 << DIO);                                       // выходы
+      DDRB &= ~ (1 << SWITCHADD);                                           // входы
+      PORTA |= (1 << LED_0);                                                // устанавливаем в 1
+      PORTA |= (1 << LED_1);                                                // устанавливаем в 1 
+}
+//----------------------------------------------------
+void initTIM1(void){
+// Счетчик 1  (16 бит)
+//   TCCR1A = [COM1A1]~[COM1A0]~[COM1B1]~[COM1B0]~[ - ]~[ - ]~[ WGM11 ]~[ WGM10 ]
+//   TCCR1B = [ICNC1]~[ICES1]~[  -  ]~[ WGM13 ]~[ WGM12 ]~[ CS12 ]~[ CS11 ]~[ CS10 ] 
+// COM-0000,(no OCR1A/B); CTC=(WGM-0100); CS - 101(clk/1024)
+      TCCR1A &= ~(1 << COM1A0);      // нормальная работа портов
+      TCCR1A &= ~(1 << COM1A1);
+      TCCR1A &= ~(1 << COM1B1);       
+      TCCR1A &= ~(1 << COM1B0);
+      
+      TCCR1B &= ~(1 << WGM13);
+      TCCR1B |= (1 << WGM12);
+      TCCR1A &= ~(1 << WGM11);
+      TCCR1A &= ~(1 << WGM10);
+      
+      TCCR1B |= (1 << CS12);
+      TCCR1B &= ~(1 << CS11);
+      TCCR1B |= (1 << CS10);
+      
+      TIMSK1 |= (1 << OCIE1A);  //разрешаю прерывания по совпадению A  
+}
+//----------------------------------------------------
+ISR(TIM1_COMPA_vect){
+    myFlag = 1;         // каждые полсекунды
+    myFlagSec = !myFlagSec;
+    if(myFlagSec){
+    saifePozIndsMas();          // раз в 1 секунду читаем время из RTC и заполняем массив digits[] 
+    myTaktTim();  // включаем LED_0/LED_1 поочередно каждую 0 секунду
+    }
+}
+//----------------------------------------------------
+void myMode(uint8_t mode){
+  uint8_t myTMP;
+  // 6 режимов переключаются кнопкой SWITCHMODE-при нажатии кнопки переход в следующий режим: 
+  // 1-установка значения первого индикатора = моргает первый индикатор и кнопкой SWITCHINCR увеличиваются значения по кругу десятки часов 0,1,2
+  // 2-установка значения второго индикатора = моргает второй индикатор и кнопкой SWITCHINCR увеличиваются значения по кругу единицы часов 0-9
+  // 3-установка значения третьего индикатора = моргает третий индикатор и кнопкой SWITCHINCR увеличиваются значения по кругу десятки минут 0-5
+  // 4-установка значения четвертого индикатора = моргает четвертый индикатор и кнопкой SWITCHINCR увеличиваются значения по кругу единицы минут 0-9
+  // 5- запись в RTC и выход из режима установки в обычный режим индикации
+  // 0- обычный режим индикации
+
+    // переходы режимов переключаются кнопкой SWITCH_DMY:
+  // 6- установка день Н
+  // 7- установка день L
+  // 8- установка месяц Н
+  // 9- установка месяц L
+  // 10- авт.установка вкл. + сек в 0 и запись в РТС
+  // 0 - обычный режим индикации
+
+    if((PINA & 0x02) == 0){       // если на PA1 (SWITCHMODE) - 0       если нажата кнопка 1
+      myFlagMode = 0;
+        myModeKn ++;        // переход на следующий mode
+        _delay_ms(50);      // чувствительность кнопки 
+    }
+    if((PINA & 0x08) == 0){       // если на PA3 (SWITCH_DMY)- 0      если нажата кнопка 3
+      myFlagMode = 1;
+        myModeKn ++;        // переход на следующий mode
+        _delay_ms(50);      // чувствительность кнопки 
+    } 
+
+    if(myModeKn == 1){
+        if(myFlagS == 0){
+            for(uint8_t i=0; i<4; i++){     // сохраняем значения в массиве digitsTMP для его редактирования
+                if(myFlagMode == 0){
+                    digitsTMP[i] = digits[i]; 
+                }else{
+                    digitsTMP[i] = digitsH[i];   
+                }
+            }
+            myFlagS = 1;
+        }
+    }
+    
+    if(myModeKn == 5){
+      // запись
+        if(myFlagMode == 0){
+            myTMP = ((digitsTMP[2] << 4) | digitsTMP[3]);     // 2-3
+            UsiWriteRTC(1, myTMP);                            // запись в 1 регистр значения 10   - минуты
+            myTMP = ((digitsTMP[0] << 4) | digitsTMP[1]);     // 0-1
+            UsiWriteRTC(2, myTMP);                            // запись в 2 регистр значения 22   - часы
+        }else{
+            myTMP = ((digitsTMP[2] << 4) | digitsTMP[3]);     // 2-3
+            UsiWriteRTC(5, myTMP);                            // запись в 5 регистр значения 10   - месяц
+            myTMP = ((digitsTMP[0] << 4) | digitsTMP[1]);     // 0-1
+            UsiWriteRTC(4, myTMP);                            // запись в 4 регистр значения 22   - день(число)
+            UsiWriteRTC(0, 0);   // запись в 0 регистр значения 0     - секунды + старт
+        }
+        _delay_ms(50); 
+        myModeKn = 0; 
+        myFlagS = 0; 
+    }
+
+    if((PINA & 0x04) == 0){       // если на PA2 (SWITCHINCR)- 0    если нажата кнопка 2    
+        switch(mode){
+            case 1:
+                mySwitchKn = digitsTMP[0];   // десятки часы 0,1,2      десятки день 0,1,2
+                mySwitchKn ++;
+                    if(myFlagMode == 0){
+                        if(mySwitchKn > 2){mySwitchKn = 0;}
+                    }else{
+                        if(mySwitchKn > 3){mySwitchKn = 0;}                   // нет ограничения на 32-39  
+                    }
+                digitsTMP[0] = mySwitchKn;
+            break;
+            case 2:
+                mySwitchKn = digitsTMP[1];   // единицы часы 0-9        единицы день 0-9 
+                mySwitchKn ++;
+                if(mySwitchKn > 9){mySwitchKn = 0;}
+                digitsTMP[1] = mySwitchKn;
+            break;
+            case 3:
+                mySwitchKn = digitsTMP[2];   // десятки минуты 0-5      десятки месяц 0-5
+                mySwitchKn ++;
+                    if(myFlagMode == 0){
+                        if(mySwitchKn > 5){mySwitchKn = 0;}
+                    }else{
+                        if(mySwitchKn > 1){mySwitchKn = 0;}                   // нет ограничения на 13-19  
+                    }
+                digitsTMP[2] = mySwitchKn;
+            break;
+            case 4:
+                mySwitchKn = digitsTMP[3];   // единицы минуты 0-9      единицы месяц 0-9
+                mySwitchKn ++;
+                if(mySwitchKn > 9){mySwitchKn = 0;}
+                digitsTMP[3] = mySwitchKn;
+            break;  
+        }
+        _delay_ms(50);      // чувствительность кнопки 
+    }
+
+    if((PINB & 0x04) == 0){       // если на PB2 (SWITCHADD)- 0 ручное управление   если нажата кнопка 4
+        myFlgDop = 1;
+        _delay_ms(50);      // чувствительность кнопки   
+    }
+}
+//----------------------------------------------------
+void myLedOnOff(uint8_t myOn){
+    if(myOn == 1){
+        if(myTakt == 0){
+            PORTA &= ~(1 << LED_0); 
+            myTakt = 1;
+        }else{
+            PORTA &= ~(1 << LED_1); 
+            myTakt = 0;  
+        }  
+    }else{
+        while((PINA & 0xA0) < 0xA0){         // 0b10100000 PA7 PA5  пока оба не выключатся
+            PORTA |= (1 << LED_0);
+            PORTA |= (1 << LED_1);  
+            _delay_us(20);
+        }     
+    }
+}
+//----------------------------------------------------
+void myTaktTim(){     // включение соответствующего выхода/выключение обоих             ОСТАВЛЯЕМ, УПРАВЛЕНИЕ ЛЕДАМИ
+     if(myTikSec == 0){     // каждую нулевую секунду включаем  
+          mySaveSec = LONGSIGNAL; // запоминаем время отключения
+          myFlgOn = 1; 
+     } 
+      
+    if(myModeKn == 0){
+        if(myTikSec == 5){    // на 5 сек
+            myModeKn = 6;     // стоп моде для отображения дня и месяца на индикаторе 
+        }
+    }
+    if(myTikSec == 10){     // на 10 сек
+        if(myModeKn == 6){
+            myModeKn = 0;     // переход в обычный режим
+        }
+    }
+
+    if(myModeKn == 0){
+        if(myTikSec > 10){                       // ручное переключение матричных часов в диапазоне от 11 до 57 секунды
+            if(myTikSec < 57){
+                if(myFlgDop == 1){
+                    if(myFlgOn == 0){
+                          mySaveSec = myTikSec + LONGSIGNAL;     // запоминание секунд
+                          myFlgOn = 1;      // старт  
+                          myFlgDop = 0;
+                    }else{
+                        myFlgDop = 0;                         
+                    }
+                }
+            }else{
+                myFlgDop = 0;   
+            }
+        }else{
+            myFlgDop = 0; 
+        }
+    }else{
+        myFlgDop = 0; 
+    }
+
+    if(myTikSec > mySaveSec){
+          myFlgOn = 0;          // стоп если время вышло
+     }  
+
+    if(myFlgOn == 0){
+          myLedOnOff(0);        // стоп 
+    }
+    if(myFlgOn == 1){
+          myLedOnOff(1);
+          myFlgOn = 3;
+    }
+}
+//-------------------------------------------------- 
+void USI_Init(void){
+      DDRA |= (1 << PIN_SDA) | (1 << PIN_SCL);                                    // SCL и SDA как выходы
+      PORTA |= (1 << PIN_SDA) | (1 << PIN_SCL);                                   // на выходах SCL = 1 и SDA = 1 (линия отпущена)
+    
+      USIDR =  0xFF;                                                  // Предварительно загружаем в регистр данные
+    
+      // USICR = [0<<USISIE]-[0<<USIOIE]-[1<<USIWM1]-[0<<USIWM0]-[1<<USICS1]-[0<<USICS0]-[1<<USICLK]-[0<<USITC]   // 0b0010`1010 = 0x2A = 42
+      USICR &= ~(1 << USISIE) | (1 << USIOIE) | (1 << USIWM0) | (1 << USICS0) | (1 << USITC);             // запрещаем прерывания
+      USICR |= (1 << USIWM1)|(1 << USICS1)|(1 << USICLK);                               // 10-режим I2С, 10-внешний источник синхронизации, 1- програмный тактовый строб
+    
+      // USISR = [1<<USISIF]-[1<<USIOIF]-[1<<USIPF]-[1<<USIDC]-[0<<USICNT3]-[0<<USICNT2]-[0<<USICNT1]-[0<<USICNT0]    // 0b1111`0000 = 0xF0 = 240
+      USISR |= (1 << USISIF)|(1 << USIOIF)|(1 << USIPF)|(1 << USIDC);                         // очистим флаги
+      USISR &= ~(1 << USICNT3) | (1 << USICNT2) | (1 << USICNT1) | (1 << USICNT0);                  // сбросим счетчик
+}
+//---------------------------------------------------------------
+void USI_ByteW(uint8_t myData, uint8_t mode){
+      USIDR = myData;
+      USISR = TICKCOUNT_8;              // выставляем счётчик
+      pulseSCL();
+      USIDR = 0xFF;                 // отпускаем линию sda   для приема ACK записываем SDA = 1 т.к. прозрачная защёлка и MSB = 1
+      DDRA &= ~(1 << PIN_SDA);            // Enable SDA as input.
+      
+      USISR = TICKCOUNT_1;              // установка счетчика на 2 тика
+      pulseSCL();
+  
+      if(mode == 0){
+          while(!(PINA & (1 << PIN_SDA)));        // если слейв отпустил шину SDA=1 Включить SDA в качестве выхода.
+          _delay_us(4);
+          DDRA |= (1 << PIN_SDA);             // Включить SDA в качестве выхода.
+      }
+}
+//---------------------------------------------------------------
+uint8_t USI_ByteR(uint8_t mData, uint8_t mode){        // mData - если не ноль - ACK и читаем дальше, если 0 - NACK  и стоп; mode = 1 (чтение)
+   uint8_t myRD = 0;
+      USISR = TICKCOUNT_8;              // выставляем счётчик и запускаем до флага переполнения счётчика  
+      pulseSCL();
+      
+      myRD =  USIDR;                  //прочитать значение регистра
+      
+      while(!(PINA & (1 << PIN_SDA)));        // если слейв отпустил шину SDA=1 Включить SDA в качестве выхода.
+      USIDR = 0x00;
+      _delay_us(4);
+      DDRA |= (1 << PIN_SDA);             // Включить SDA в качестве выхода.
+      
+      if(mData > 1){                                  // если mData = 0 -NACK
+        USISR = TICKCOUNT_1;              // установка счетчика на 2 тика
+        pulseSCL(); 
+        DDRA &= ~(1 << PIN_SDA);            // Enable SDA as input.
+      }else{
+        USIDR = 0xFF;
+        USISR = TICKCOUNT_1;              // установка счетчика на 2 тика
+        pulseSCL(); 
+      }
+
+      return myRD;    
+}
+//---------------------------------------------------------------
+void USI_Control(uint8_t Adr, uint8_t mode){      // mode - чтение/запись  1/0          [START - ADRRAB - ADRMEM]
+      USI_start();
+      USI_ByteW((MEM_ADR | mode), mode);          // Контрольный байт MEM_ADR + bit R/W = 0b0101`0000
+      USI_ByteW(Adr, mode);
+}
+//---------------------------------------------------------------
+void pulseSCL(void){
+      do{                       // дергание счетчиком, регистром USIDR и SCL
+          _delay_us(5);
+          USICR = REVERS_SCL;                         // Сгенерируйте положительный фронт SCL = 1
+          while(!(PINA & (1 << PIN_SCL)));            // Подождите, пока SCL станет высоким.
+          _delay_us(4);
+          USICR = REVERS_SCL;             // Сгенерировать отрицательный фронт SCL = 0   (данные из USIDR появятся на линии SDA именно при переходе линии SCL из ‘1’ в ‘0’
+      }while( !(USISR & (1 << USIOIF)) );       // пока не установится флаг переполнения счетчика
+      _delay_us(2);
+}
+//---------------------------------------------------------------
+void USI_start(){
+      PORTA |= (1 << PIN_SCL);            // SCL = 1
+      while(!(PORTA & (1 << PIN_SCL)));       // Проверяем что SCL высокий.   ???
+      _delay_us(5);
+      PORTA &= ~(1 << PIN_SDA);           // SDA = 0   мастер забирает шину на себя для генерации старта
+      _delay_us(4);
+      PORTA &= ~(1 << PIN_SCL);           // SCL = 0
+      PORTA |= (1 << PIN_SDA);            // SDA = 1   освобождаем шину, чтобы ею дергал Регистр USIDR на отрицательном фронте SCL
+}
+//---------------------------------------------------------------
+void USI_stop(){
+      PORTA &= ~(1<<PIN_SDA);           // SDA = 0
+      PORTA |= (1<<PIN_SCL);            // SCL = 1
+      while( !(PINA & (1<<PIN_SCL)) );  // Подождём, пока SCL станет высоким.
+      _delay_us(4);
+      PORTA |= (1<<PIN_SDA);            // SDA = 1
+      _delay_us(5);
+      _delay_us(300);
+}
+//-------------------------------------------------- 
+void UsiWriteRTC(uint8_t myRegister, uint8_t myDate){      // myRegister - номер регистра 0-6
+      USI_Control(myRegister, 0);
+      USI_ByteW(myDate, 0);      // запись  в регистр значения myDate
+      USI_stop();  
+}
+//----------------------------------------------------
+uint8_t UsiReadTime(uint8_t rtcRegister){
+  uint8_t myRegister = 0;
+      USI_Control(rtcRegister, 0);    // отправляем адрес регистра чтения 
+      USI_start();          // повторный старт
+      USI_ByteW((MEM_ADR | 1), 1);      
+      myRegister = USI_ByteR(0, 1);   
+      USI_stop();
+  
+      return myRegister;
+}
+//----------------------------------------------------
+void saifePozIndsMas(void){     // сохраняем новые значения из RTC в массиве
+  uint8_t mySecL;
+  uint8_t mySecH;
+  uint8_t myMinL;
+  uint8_t myMinH;
+  uint8_t myHourL;
+  uint8_t myHourH; 
+  uint8_t myDateL;
+  uint8_t myDateH;
+  uint8_t myMonthL;
+  uint8_t myMonthH;
+  //uint8_t myYearL;
+  //uint8_t myYearH;
+  uint8_t myMinTMP;
+  uint8_t myHourTMP;  
+  uint8_t myDateTMP;
+  uint8_t myMonthTMP;
+  //uint8_t myYearTMP;
+  
+      myNullsec = UsiReadTime(0);         // счет секунд
+      mySecL = myNullsec & 0x0F;          // единицы секунд
+      mySecH = (myNullsec & 0x70) >> 4;   // десятки секунд
+      
+      myMinTMP = UsiReadTime(1);             // читаем время(минуты) из RTC
+      myHourTMP = UsiReadTime(2);            // читаем время(часы) из RTC
+      myDateTMP = UsiReadTime(4);         // читаем дату(день) из RTC
+      myMonthTMP = UsiReadTime(5);        // читаем месяц из RTC
+      //myYearTMP = UsiReadTime(6);         // читаем год из RTC
+      
+      myMinL = myMinTMP & 0x0F;
+      myMinH = (myMinTMP & 0x70) >> 4;
+      myHourL = myHourTMP & 0x0F;
+      myHourH = (myHourTMP & 0x30) >> 4;
+      myDateL = myDateTMP & 0x0F;
+      myDateH = (myDateTMP & 0x30) >> 4;
+      myMonthL = myMonthTMP & 0x0F;
+      myMonthH =(myMonthTMP & 0x10) >> 4;
+      //myYearL = myYearTMP & 0x0F;
+      //myYearH = (myYearTMP & 0xF0) >> 4;
+
+
+      //myTikSec = myDec[mySecH] | mySecL;    //секунды 0-59
+      myTikSec = myDec[mySecH] + mySecL;    //секунды 0-59
+      
+      digits[3] = myMinL;     // единицы минут  
+      digits[2] = myMinH;
+      digits[1] = myHourL;
+      digits[0] = myHourH;    // десятки часов
+      
+      //digitsH[3] = myDateL;                                               
+      //digitsH[2] = myDateH;
+      //digitsH[1] = myMonthL;
+      //digitsH[0] = myMonthH;
+
+      digitsH[3] = myMonthL;                                               
+      digitsH[2] = myMonthH;
+      digitsH[1] = myDateL;
+      digitsH[0] = myDateH;
+      //digitsH[1] = myYearL;
+      //digitsH[0] = myYearH;
+}
+//----------------------------------------------------
+//----------------------------------------------------
+int main(void){
+    initIO();
+    USI_Init();
+    initTIM1();
+    OCR1A = PRESKALLER;
+    sei();
+
+    //UsiWriteRTC(0, 0);   // запись в 0 регистр значения 0     - секунды + старт
+    //UsiWriteRTC(1, 10);  // запись в 1 регистр значения 10   - минуты
+    //UsiWriteRTC(2, 22);  // запись в 2 регистр значения 22   - часы
+    
+    while (1){
+      myMode(myModeKn);
+      
+      switch (myModeKn){
+        case 0:
+           if(myFlag == 1){
+              myFlagN = !myFlagN;
+              if(myFlagN){
+                  myDisplayTime(digits[0], digits[1], digits[2], digits[3], 1, 2);          
+              }else{
+                  myDisplayTime(digits[0], digits[1], digits[2], digits[3], 0, 2);
+              }
+              myFlag = 0;
+           }         
+        break;
+
+        case 1:
+            myBlinkDisp(0);
+        break;
+        case 2:
+            myBlinkDisp(1);
+        break;
+        case 3:
+            myBlinkDisp(2);
+        break;
+        case 4:
+            myBlinkDisp(3);
+        break;
+        case 6:
+            myDisplayTime(digitsH[0], digitsH[1], digitsH[2], digitsH[3], 0, 2);
+        break;
+      }
+    }
+}
+//----------------------------------------------------
+void myBlinkDisp(uint8_t nomDisp){
+      if(myFlag == 1){
+          myDisplayTime(digitsTMP[0], digitsTMP[1], digitsTMP[2], digitsTMP[3], 0, 2);         
+          _delay_ms(40);
+          myWriteFix(nomDisp, 10, 0, 2);      // гасим 2 разряд индикатора
+          myFlag = 0;
+       }  
+}
+//----------------------------------------------------
+//----------------------------------------------------
+void myStart(void){
+      PORTB |= (1 << CLK);
+      PORTB |= (1 << DIO); 
+      PORTB &= ~(1 << DIO); 
+      PORTB &= ~(1 << CLK);   
+}
+//----------------------------------------------------
+void myStop(void){
+      PORTB &= ~(1 << CLK); 
+      PORTB &= ~(1 << DIO); 
+      PORTB |= (1 << CLK);
+      PORTB |= (1 << DIO);
+}
+//----------------------------------------------------
+//void myClear(void){
+//      myDisplayTime(10,10,10,10,0, 3, 1);    // 3- яркость
+//}
+//----------------------------------------------------
+int  writeByte(int8_t wr_data){     // запись ДАТА
+  uint8_t i, count1;
+  uint8_t ack;
+      for (i = 0; i < 8; i++){                      //sent 8bit data
+          PORTB &= ~(1 << CLK); 
+              if (wr_data & 0x01){
+                  PORTB |= (1 << DIO);    //LSB first
+              }else{
+                  PORTB &= ~(1 << DIO);
+              }
+          wr_data >>= 1;      // переход на следующий разряд (сдвиг вправо)
+          PORTB |= (1 << CLK);;
+      }
+      PORTB &= ~(1 << CLK); //wait for the ACK
+      PORTB |= (1 << DIO);
+      PORTB |= (1 << CLK);
+      DDRB &= ~(1 << DIO);      // pinMode(Datapin, INPUT);  
+      _delay_us(50); 
+      if((PINB & 8) == 1){      // ack = digitalRead(Datapin);
+          ack = 1;  
+      }else{
+          ack = 0;  
+      }
+      if (ack == 0)
+      {
+          DDRB |= (1 << DIO);       // pinMode(Datapin, OUTPUT);
+          PORTB &= ~(1 << DIO);     // digitalWrite(Datapin, LOW);
+      }
+      _delay_us(50); 
+      DDRB |= (1 << DIO);     //pinMode(Datapin, OUTPUT);
+      _delay_us(50); 
+      return ack;
+}
+//----------------------------------------------------
+void myWritePlus(uint8_t myBright){     // 1-автоматическое увеличение адреса(дисплея)
+      myStart();
+      writeByte(commandOne[0]);   // 0-0x40(++)
+      myStop();
+      myStart();
+      writeByte(commandTwo[0]);     // 0-номер дисплея
+      for (byte i = 0; i < 4; i ++) {
+          writeByte(myMasData[i]);      // Date0, Date1...
+      }
+      myStart();
+      writeByte(commandThree[myBright]);     // яркость макс 8
+      myStop();
+}
+//----------------------------------------------------
+void myWriteFix(uint8_t mode, uint8_t outDec, uint8_t outSim, uint8_t myBright){     //2-фиксированный вывод: mode - 0-3/4 выбор запись в один или во все 4 дисплея; outSim - 0/1 выбор массива цифры/черточки; outDec - цифра/черточка 
+  uint8_t myDec;
+      if(outSim == 0){
+          myDec = digitHEX[outDec];      // вывожу только цифры  
+      }else{
+          myDec = digitLed[outDec];     // вывод только черточек 
+      }
+      
+      myStart();
+      writeByte(commandOne[1]);   // 1-0x44(фикс)
+      myStop();           //
+      if(mode < 4){
+          myStart();
+          writeByte(commandTwo[mode]); 
+          writeByte(myDec); 
+          myStop();       
+      }else{
+          for (byte i = 0; i < 4; i ++) {
+              myStart();
+              writeByte(commandTwo[i]); 
+              writeByte(myMasData[i]); 
+              myStop();               
+          }
+      }
+      myStart();
+      writeByte(commandThree[myBright]);     // яркость макс 8
+      myStop(); 
+}
+//----------------------------------------------------
+void myDisplayTime(uint8_t mHourH, uint8_t mHourL, uint8_t mMinH, uint8_t mMinL, uint8_t nDot, uint8_t myBright){     // nDot 1/0  с точкой/без точки   myPlus-1/0(++/фиксированный)
+      myMasData[0] = digitHEX[mHourH];
+      if(nDot == 1){
+          myMasData[1] = digitHEX[mHourL] | 0x80;      // две точки только на 1-м индикаторе 7  
+      }else{
+          myMasData[1] = digitHEX[mHourL];             // без точек
+      }
+      myMasData[2] = digitHEX[mMinH];
+      myMasData[3] = digitHEX[mMinL];  
+      //if(myPlus == 1){
+      //    myWritePlus(myBright);  
+      //}else{
+          myWriteFix(4, digitHEX[1], 1, myBright);      // если стоит 4 то digitHEX[1] не отображается, всё берётся из массива myMasData[]  
+      //}
+}
+//----------------------------------------------------
